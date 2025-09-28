@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import logging
 import os.path
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +24,8 @@ logging.basicConfig(level=logging.DEBUG, format="%(message)s")
 
 MAX_CPU_COUNT = os.cpu_count() or 8
 
+TEXT_FILE_TYPES = re.compile("(text|utf|unicode).*")
+
 
 def compute_digest(path: str, file_type: str) -> str:
     """
@@ -29,12 +33,13 @@ def compute_digest(path: str, file_type: str) -> str:
     """
     h = hashlib.md5()
     with open(path, "rb") as f:
-        if file_type.split("+")[0] in ["text", "utf8"]:
+        if TEXT_FILE_TYPES.match(file_type):
             for line in f:
                 # perforce stores/hashes all text files with LF line endings, convert any CRLF -> LF
                 line = line.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
                 h.update(line)
         else:
+            # 64KB seems to be a good chuk size for both small and large files
             for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
     # p4 digests are all uppercase
@@ -162,8 +167,16 @@ def load_toml_config(file_path: str) -> dict:
 
 
 class P4HarmonizeGit(object):
+    # the default set of source files to ignore, as fnmatch patterns against relative paths
+    default_src_ignore = []
+
+    # the default set of destination files to ignore (to not delete them), as fnmatch patterns against relative paths
+    default_dst_ignore = []
+
     def __init__(self, config_file: str, dry_run=False):
         self.config = load_toml_config(config_file)
+        self.src_ignore = self.config["source"].get("ignore", self.default_src_ignore)
+        self.dst_ignore = self.config["destination"].get("ignore", self.default_dst_ignore)
         self._p4 = None
         self.p4_info = None
         self.dry_run = dry_run
@@ -268,6 +281,7 @@ class P4HarmonizeGit(object):
             self.p4.save_client(client)
 
     def create_dest_p4_changelist(self, description: str) -> str:
+        # TODO: create a changelist with the description and use it when opening files
         return "123"
 
     def delete_p4_client(self, p4client: str):
@@ -281,19 +295,17 @@ class P4HarmonizeGit(object):
         if not self.dry_run:
             self.p4_run(["client", "-df", p4client])
 
-    def copy_files_to_dest(self, src_files: list[GitFile]) -> list[str]:
-        LOG.info(f"Copying {len(src_files)} files to destination workspace...")
+    def should_ignore_src(self, src: GitFile):
+        for pattern in self.src_ignore:
+            if fnmatch.fnmatch(src.relative_path, pattern):
+                return True
+        return False
 
-        dst_root = self.config["destination"]["root"]
-        result = []
-        for src_file in src_files:
-            dst_file = os.path.join(dst_root, src_file.relative_path)
-            if not self.dry_run:
-                os.makedirs(os.path.dirname(dst_file), exist_ok=True)
-                shutil.copy2(src_file.full_path, dst_file, follow_symlinks=False)
-            result.append(dst_file)
-
-        return result
+    def should_ignore_dst(self, dst: P4File):
+        for pattern in self.dst_ignore:
+            if fnmatch.fnmatch(dst.relative_path, pattern):
+                return True
+        return False
 
     def get_src_files(self) -> list[GitFile]:
         src_files = self.list_git_files(self.config["source"]["root"])
@@ -309,11 +321,14 @@ class P4HarmonizeGit(object):
     def get_diff(self) -> P4GitFileDiff:
         LOG.info(f"Finding files in source ({self.config['source']['root']})...")
         src_files = self.get_src_files()
-        LOG.info(f"Found {len(src_files)} total source files")
+        src_files = [src for src in src_files if not self.should_ignore_src(src)]
+        LOG.info(f"Found {len(src_files)} total source files (after ignores)")
 
         # list files from dest depot
         LOG.info(f"Finding files in destination ({self.config['destination']['stream']})...")
         dst_files = self.get_dst_files()
+        dst_files = [dst for dst in dst_files if not self.should_ignore_dst(dst)]
+        LOG.info(f"Found {len(dst_files)} total destination files (after ignores)")
 
         # calculate the actual difference (src only, dst only, changed, etc.)
         return P4GitFileDiff(src_files, dst_files)
@@ -393,7 +408,6 @@ class P4HarmonizeGit(object):
 
     def copy_file_to_dst(self, src: GitFile):
         dst_path = self.get_dst_path(src)
-        LOG.info(f"Copying {src.relative_path}")
         if not self.dry_run:
             os.makedirs(os.path.dirname(dst_path), exist_ok=True)
             shutil.copy2(src.full_path, dst_path, follow_symlinks=False)
@@ -418,9 +432,29 @@ class P4HarmonizeUnrealGit(P4HarmonizeGit):
     git_dependencies_path = "Engine/Binaries/DotNET/GitDependencies/win-x64/GitDependencies.exe"
     ue_dependencies_path = ".uedependencies"
 
-    # additional files to ignore that are specific to GitHub UnrealEngine
-    ignore_files = [
-        "",
+    # if not specified in the config, the default set of files
+    # to ignore, specific to GitHub UnrealEngine
+    default_src_ignore = [
+        ".gitattributes",
+        ".gitignore",
+        ".tgitconfig",
+        "LICENSE.md",
+        "PULL_REQUEST_TEMPLATE.md",
+        "README.md",
+        "SECURITY.md",
+        "Setup.bat",
+        "Setup.command",
+        "Setup.sh",
+        "*.DS_Store/*",
+    ]
+
+    default_dst_ignore = [
+        ".p4ignore.txt",
+        "RunUAT.bat",
+        "RunUAT.sh",
+        "RunUBT.bat",
+        "RunUBT.sh",
+        "vs-chromium-project.txt",
     ]
 
     def pre_run(self):
