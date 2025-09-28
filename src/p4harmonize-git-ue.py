@@ -4,7 +4,6 @@ import fnmatch
 import hashlib
 import logging
 import os.path
-import re
 import shutil
 import subprocess
 import sys
@@ -24,24 +23,39 @@ logging.basicConfig(level=logging.DEBUG, format="%(message)s")
 
 MAX_CPU_COUNT = os.cpu_count() or 8
 
-TEXT_FILE_TYPES = re.compile("(text|utf|unicode).*")
-
 
 def compute_digest(path: str, file_type: str) -> str:
     """
-    Compute the MD5 digest of a file, knowing it's expected type (e.g. from perforce)
+    Compute the MD5 digest of a file, knowing it's expected type (e.g. from perforce).
+    If the file type has changed, the digests will just mismatch and so perforce will handle
+    actually comparing the difference, which is nbd.
     """
+    # perforce stores/hashes all text files with LF line endings, convert any CRLF -> LF
+    # also remove BOM from utf files if present, since p4 seems to also ignore them when hashing
     h = hashlib.md5()
     with open(path, "rb") as f:
-        if TEXT_FILE_TYPES.match(file_type):
+        if "text" in file_type:
             for line in f:
-                # perforce stores/hashes all text files with LF line endings, convert any CRLF -> LF
-                line = line.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                line = line.replace(b"\r\n", b"\n")
                 h.update(line)
+
+        elif "utf8" in file_type:
+            for line in f:
+                # read in utf-8-sig to strip BOMs
+                line = line.decode("utf-8-sig").encode("utf-8").replace(b"\r\n", b"\n")
+                h.update(line)
+
+        elif "utf16" in file_type:
+            # read in utf-16 to strip BOMs, p4 seems to always hash in utf-8...
+            data = f.read().decode("utf-16").encode("utf-8").replace(b"\r\n", b"\n")
+            h.update(data)
+
         else:
+            # binary
             # 64KB seems to be a good chuk size for both small and large files
             for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
+
     # p4 digests are all uppercase
     return h.hexdigest().upper()
 
@@ -89,6 +103,13 @@ class P4File(object):
 class P4GitFileDiff(object):
     """
     Represents a diff between a source Git repo and destination P4 stream.
+
+    GitFiles don't actually have to be tracked (there can be extras) but usually
+    come from git ls-tree. Content-only differences are checked first by file size
+    (for binary files only, since ascii line endings can affect this),
+    then by computing a digest for the source files and comparing with p4's digest.
+
+    The results are in the lists `src_only`, `dst_only`, `case_mismatch` and `changed`.
     """
 
     def __init__(self, src_files: list[GitFile], dst_files: list[P4File]):
@@ -207,7 +228,7 @@ class P4HarmonizeGit(object):
             sys.exit(1)
         return p4
 
-    def is_case_sensitive(self):
+    def is_p4_case_sensitive(self):
         self.ensure_p4_connection()
         return self.p4_info["clientCase"] != "insensitive"
 
@@ -239,8 +260,6 @@ class P4HarmonizeGit(object):
                 tmp.writelines([f"{f}\n" for f in files])
                 tmp.flush()
                 tmp.close()
-                # with open(tmp_path, "rb") as fp:
-                #     print(repr(fp.read()))
                 self.p4_cmd(["-x", tmp_path, *args])
         else:
             LOG.info(f"p4 -x ... {subprocess.list2cmdline(args)}")
@@ -337,7 +356,7 @@ class P4HarmonizeGit(object):
         """
         Perform some initial checks to make sure we can run successfully.
         """
-        # self.ensure_dst_p4_client_doesnt_exist()
+        self.ensure_dst_p4_client_doesnt_exist()
 
         dest_root = self.config["destination"]["root"]
         if os.path.isdir(dest_root) and os.listdir(dest_root):
@@ -351,6 +370,7 @@ class P4HarmonizeGit(object):
         pass
 
     def run(self):
+        start = time.perf_counter()
         self.run_validate()
 
         self.pre_run()
@@ -360,6 +380,7 @@ class P4HarmonizeGit(object):
         self.create_dest_p4_client()
 
         diff = self.get_diff()
+        diff.log_diff()
 
         if not diff.has_difference():
             LOG.info("All files in source and destination already match")
@@ -379,29 +400,46 @@ class P4HarmonizeGit(object):
         with ThreadPoolExecutor(max_workers=MAX_CPU_COUNT) as executor:
             list(executor.map(self.copy_file_to_dst, files_to_copy))
 
-        # mark files for delete
+        # mark files for delete (`dst_only`, as well as `case_mismatch` on a case-insensitive server)
         files_to_delete = {dst.client_path for dst in diff.dst_only}
+
         if diff.case_mismatch:
-            LOG.warning(
-                "Found files that differ in case-only, but the destination server is case insensitive. "
-                "Perforce can't fix case issues on a case insensitive server in one submit. "
-                "The mismatching files will be staged for delete. After submitting, re-run this tool "
-                "to re-add the deleted files with the correct case. "
-                "See https://portal.perforce.com/s/article/3448 for more details."
-            )
-            files_to_delete.update({dst.client_path for src, dst in diff.case_mismatch})
-        self.p4_cmd_batch(["delete"], files_to_delete, "p4harmonize_git_delete_")
+            if self.is_p4_case_sensitive():
+                # check out and move case mismatches (individually)
+                for src, dst in diff.case_mismatch:
+                    self.p4_run(["edit", dst.client_path])
+                    self.p4_run(["move", dst.client_path, self.get_dst_path(src)])
+            else:
+                # mark case mismatches for delete, and require a re-run of this tool
+                LOG.warning(
+                    "Found files that differ in case-only, but the destination server is case insensitive. "
+                    "Perforce can't fix case issues on a case insensitive server in one submit. "
+                    "The mismatching files will be staged for delete. After submitting, re-run this tool "
+                    "to re-add the deleted files with the correct case. "
+                    "See https://portal.perforce.com/s/article/3448 for more details."
+                )
+                for src, dst in diff.case_mismatch:
+                    LOG.debug(f"Case change: {dst.relative_path} -> {src.relative_path}")
+                files_to_delete.update({dst.client_path for src, dst in diff.case_mismatch})
+
+        if files_to_delete:
+            self.p4_cmd_batch(["delete"], files_to_delete, "p4harmonize_git_delete_")
 
         # check out files
-        self.p4_cmd_batch(["add"], [self.get_dst_path(f) for f in files_to_add], "p4harmonize_git_add_")
-        self.p4_cmd_batch(["edit"], [self.get_dst_path(f) for f in files_to_edit], "p4harmonize_git_edit_")
+        if files_to_add:
+            self.p4_cmd_batch(["add"], [self.get_dst_path(f) for f in files_to_add], "p4harmonize_git_add_")
+        if files_to_edit:
+            self.p4_cmd_batch(["edit"], [self.get_dst_path(f) for f in files_to_edit], "p4harmonize_git_edit_")
 
         # revert unchanged files
         self.p4_run(["revert", "-a"])
 
-        # TODO: handle moves for case-change on case-sensitive server...
-
         self.post_run(diff)
+
+        end = time.perf_counter()
+        minutes, secs = divmod(end - start, 60)
+        LOG.info(f"Finished ({minutes}m {secs:.1f}s)")
+        LOG.info("Any changes are staged p4, review and submit when ready.")
 
     def get_dst_path(self, src: GitFile) -> str:
         return os.path.join(self.config["destination"]["root"], src.relative_path).replace("\\", "/")
@@ -528,7 +566,7 @@ def run(config_file: str, dry_run=False):
     p4h.run()
 
     if dry_run:
-        print("This was a dry-run.")
+        LOG.info("This was a dry-run.")
 
 
 @cli.command()
@@ -542,7 +580,7 @@ def clean(config_file: str, dry_run=False):
     p4h.clean()
 
     if dry_run:
-        print("This was a dry-run.")
+        LOG.info("This was a dry-run.")
 
 
 if __name__ == "__main__":
