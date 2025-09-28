@@ -1,10 +1,14 @@
 # P4 Harmonize for Git UnrealEngine
 
-- A tool for mirroring a git branch's latest commit to perforce.
+- A tool for mirroring a git commit to perforce.
 - Purpose built for syncing [UnrealEngine](https://github.com/EpicGames/UnrealEngine/) releases to a local p4 server.
 - Based on [p4harmonize](https://github.com/danbrakeley/p4harmonize) which is a tool for mirroring p4-to-p4.
 
 ## Usage
+
+```
+$ pip install -r requirements.txt
+```
 
 - Create a `config.toml` mapping the source git repo and destination p4 server.
 - Set `is_unreal` to True to enable some Unreal-specific behavior:
@@ -56,3 +60,8 @@ $ python p4harmonize-git-ue.py clean
 - Unchanged files are reverted with `p4 revert -a`, this also handles any false-positives from the digest checks.
 
 > Nothing is ever submitted automatically, review and submit after running the tool.
+
+## TODO
+
+- Run `git checkout` to ensure the source repo has no local modifications.
+- Add some p4 type hinting based on Epic's p4 type rules, or verify the p4 servers typemap, etc.
