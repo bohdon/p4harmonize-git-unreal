@@ -42,3 +42,17 @@ $ python p4harmonize-git-ue.py run
 ```bash
 $ python p4harmonize-git-ue.py clean
 ```
+
+## How it works
+
+- Files are listed from source and destination using `git ls-tree` and `p4 fstat`, so untracked files are ignored.
+- Additional UnrealEngine files are discovered from `.uedependencies` (stuff downloaded via `Setup.bat`)
+- An initial difference is calculated manually:
+  - Source or destination only files are easily marked for add/delete
+  - Case mismatches are handled as `p4 move` (case-sensitive server) or `p4 delete`, which requires a second run
+  - A simple file size check is done for binary files, and then an `md5` digest is calculated and compared against p4's
+    known digest.
+- Files are copied from git repo -> p4 workspace and staged.
+- Unchanged files are reverted with `p4 revert -a`, this also handles any false-positives from the digest checks.
+
+> Nothing is ever submitted automatically, review and submit after running the tool.
