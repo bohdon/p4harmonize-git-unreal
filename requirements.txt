@@ -1,2 +1,3 @@
+GitPython
 click
 p4python
