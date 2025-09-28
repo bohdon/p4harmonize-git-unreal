@@ -428,7 +428,7 @@ class P4HarmonizeGit(object):
             LOG.info(f"Destination root not found: {dest_root}")
 
 
-class P4HarmonizeUnrealGit(P4HarmonizeGit):
+class P4HarmonizeGitUnreal(P4HarmonizeGit):
     git_dependencies_path = "Engine/Binaries/DotNET/GitDependencies/win-x64/GitDependencies.exe"
     ue_dependencies_path = ".uedependencies"
 
@@ -523,7 +523,7 @@ def run(config_file: str, dry_run=False):
     config = load_toml_config(config_file)
     is_unreal = config["source"].get("is_unreal", False)
 
-    harmonize_cls = P4HarmonizeUnrealGit if is_unreal else P4HarmonizeGit
+    harmonize_cls = P4HarmonizeGitUnreal if is_unreal else P4HarmonizeGit
     p4h = harmonize_cls(config_file, dry_run=dry_run)
     p4h.run()
 
