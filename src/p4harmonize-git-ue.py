@@ -18,8 +18,38 @@ import click
 import git
 from P4 import P4
 
-LOG = logging.getLogger()
+LOG = logging.getLogger("main")
 logging.basicConfig(level=logging.DEBUG, format="%(message)s")
+
+RESET = "\033[0m"
+GREEN = "\033[32m"
+BLUE = "\033[34m"
+
+
+class ColorFormatter(logging.Formatter):
+    def __init__(self, color, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.color = color
+
+    def format(self, record):
+        message = super().format(record)
+        return f"{self.color}{message}{RESET}"
+
+
+def get_colored_log_handler(color) -> logging.Handler:
+    handler = logging.StreamHandler()
+    formatter = ColorFormatter(color, fmt="%(message)s")
+    handler.setFormatter(formatter)
+    return handler
+
+
+# add colored loggers for source/destination
+SRC_LOG = logging.getLogger("src")
+SRC_LOG.addHandler(get_colored_log_handler(BLUE))
+SRC_LOG.propagate = False
+DST_LOG = logging.getLogger("dst")
+DST_LOG.addHandler(get_colored_log_handler(GREEN))
+DST_LOG.propagate = False
 
 MAX_CPU_COUNT = os.cpu_count() or 8
 
@@ -83,15 +113,24 @@ class GitFile(object):
 
 class P4File(object):
     def __init__(self, fstat: dict, client_root: str):
-        self.depot_path: str = fstat["depotFile"]
-        self.client_path: str = fstat["clientFile"]
-        self.head_action: str = fstat["headAction"]
-        self.head_type: str = fstat["headType"]
-        self.head_change: str = fstat["headChange"]
-        self.file_size: str = fstat["fileSize"]
-        self.digest: str = fstat["digest"]
+        try:
+            self.depot_path: str = fstat["depotFile"]
+            self.head_action: str = fstat["headAction"]
+            self.head_type: str = fstat["headType"]
+            self.head_change: str = fstat["headChange"]
+            self.file_size: str = fstat["fileSize"]
+            self.digest: str = fstat["digest"]
+        except Exception as e:
+            raise ValueError(f"Invalid fstat ({e}): {fstat}")
+
+        # accept missing clientFile for dry-run
+        self.client_path: str = fstat.get("clientFile")
+
         # important that this is normalized, since it's used for comparison
-        self.relative_path = os.path.relpath(self.client_path, client_root).replace("\\", "/")
+        if self.client_path is not None:
+            self.relative_path = os.path.relpath(self.client_path, client_root).replace("\\", "/")
+        else:
+            self.relative_path = ""
 
     def __repr__(self):
         return f"<P4File '{self.relative_path}'>"
@@ -147,7 +186,8 @@ class P4GitFileDiff(object):
                 elif content_differs:
                     self.changed.append((src, dst))
                 if i > 0 and i % 50000 == 0:
-                    LOG.info(f"[{i}/{len(same_paths)}]")
+                    LOG.info(f"Comparing [{i}/{len(same_paths)}]")
+
         end = time.perf_counter()
         LOG.info(f"Finished comparison ({end - start:.1f}s)")
 
@@ -176,8 +216,8 @@ class P4GitFileDiff(object):
         return bool(self.changed or self.src_only or self.dst_only)
 
     def log_diff(self):
-        LOG.info(f"Source only: {len(self.src_only)}")
-        LOG.info(f"Destination only: {len(self.dst_only)}")
+        SRC_LOG.info(f"Source only: {len(self.src_only)}")
+        DST_LOG.info(f"Destination only: {len(self.dst_only)}")
         LOG.info(f"Case mismatch: {len(self.case_mismatch)}")
         LOG.info(f"Content Changed: {len(self.changed)}")
 
@@ -207,6 +247,9 @@ class P4HarmonizeGit(object):
         self.ensure_p4_connection()
         return self._p4
 
+    def get_dry_run_msg(self, always_run=False) -> str:
+        return " (skipped for dry-run)" if self.dry_run and not always_run else ""
+
     def ensure_p4_connection(self):
         if self._p4 is None:
             self._p4 = self.create_p4_connection()
@@ -224,7 +267,7 @@ class P4HarmonizeGit(object):
         p4.exception_level = p4.RAISE_ERRORS
 
         if not p4.connected():
-            LOG.error("Failed to create P4 connection")
+            DST_LOG.error("Failed to create P4 connection")
             sys.exit(1)
         return p4
 
@@ -233,7 +276,7 @@ class P4HarmonizeGit(object):
         return self.p4_info["clientCase"] != "insensitive"
 
     def p4_run(self, args, always_run=False):
-        LOG.info(f"p4 {' '.join(args)}")
+        DST_LOG.info(f"p4 {' '.join(args)}{self.get_dry_run_msg(always_run)}")
         if not self.dry_run or always_run:
             result = self.p4.run(*args)
         else:
@@ -244,7 +287,7 @@ class P4HarmonizeGit(object):
 
     def p4_cmd(self, args, always_run=False):
         args = ["p4", "-p", self.p4.port, "-c", self.p4.client, "-u", self.p4.user] + args
-        LOG.info(f"{subprocess.list2cmdline(args)}")
+        DST_LOG.info(f"{subprocess.list2cmdline(args)}{self.get_dry_run_msg(always_run)}")
         if not self.dry_run or always_run:
             return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return None
@@ -262,7 +305,7 @@ class P4HarmonizeGit(object):
                 tmp.close()
                 self.p4_cmd(["-x", tmp_path, *args])
         else:
-            LOG.info(f"p4 -x ... {subprocess.list2cmdline(args)}")
+            DST_LOG.info(f"p4 -x ... {subprocess.list2cmdline(args)}{self.get_dry_run_msg()}")
 
     def list_git_files(self, git_dir: str) -> list[GitFile]:
         g = git.cmd.Git(git_dir)
@@ -271,11 +314,27 @@ class P4HarmonizeGit(object):
         return result
 
     def list_p4_files(self, depot_path: str) -> list[P4File]:
-        args = ["fstat", "-T depotFile,clientFile,headAction,headChange,headType,fileSize,digest", "-Ol", depot_path]
+        args = [
+            "fstat",
+            "-T depotFile,clientFile,headAction,headChange,headType,fileSize,digest",
+            "-Ol",
+            depot_path,
+        ]
         fstats = self.p4_run(args, True)
-        if fstats and "clientFile" not in fstats[0]:
-            LOG.error("Failed to get 'clientFile' from fstat, make sure destination client exists")
-            sys.exit(1)
+
+        len_before_ignore = len(fstats)
+        ignore_actions = ("delete", "move/delete", "purge", "archive")
+        fstats[:] = [f for f in fstats if f["headAction"] not in ignore_actions]
+        len_after_ignore = len(fstats)
+        if len_before_ignore != len_after_ignore:
+            DST_LOG.debug(
+                f"Ignoring {len_before_ignore - len_after_ignore} files that were deleted, purged, or archived"
+            )
+
+        if not self.dry_run:
+            if fstats and "clientFile" not in fstats[0]:
+                DST_LOG.error("Failed to get 'clientFile' from fstat, make sure destination client exists")
+                sys.exit(1)
 
         client_root = self.config["destination"]["root"]
         return [P4File(fstat, client_root) for fstat in fstats]
@@ -284,18 +343,18 @@ class P4HarmonizeGit(object):
         client_name = self.config["destination"]["p4client"]
         existing_client = self.p4_run(["clients", "-e", client_name])
         if existing_client:
-            LOG.error(f"Destination p4 client already exists: {client_name}, run clean first or delete it manually")
+            DST_LOG.error(f"Destination p4 client already exists: {client_name}, run clean first or delete it manually")
             sys.exit(1)
 
     def create_dest_p4_client(self):
         client_name = self.config["destination"]["p4client"]
-        LOG.info(f"Creating p4 client {self.config['destination']['p4client']}")
-        client = self.p4_run(["client", "-o", client_name])[0]
+        DST_LOG.info(f"Creating p4 client {self.config['destination']['p4client']}")
+        client = self.p4_run(["client", "-o", client_name], True)[0]
         client._root = self.config["destination"]["root"]
         client._stream = self.config["destination"]["stream"]
         client["Options"] = "noallwrite noclobber nocompress unlocked modtime rmdir noaltsync"
         client["SubmitOptions"] = "leaveunchanged"
-        LOG.info("p4 client -i ...")
+        DST_LOG.info(f"p4 client -i ... {self.get_dry_run_msg()}")
         if not self.dry_run:
             self.p4.save_client(client)
 
@@ -306,10 +365,10 @@ class P4HarmonizeGit(object):
     def delete_p4_client(self, p4client: str):
         clients = self.p4_run(["clients", "-e", p4client])
         if not clients:
-            LOG.info(f"Client not found: {p4client}")
+            DST_LOG.info(f"Client not found: {p4client}")
             return
         else:
-            LOG.info(f"Deleting client: {p4client}")
+            DST_LOG.info(f"Deleting client: {p4client}")
 
         if not self.dry_run:
             self.p4_run(["client", "-df", p4client])
@@ -328,26 +387,26 @@ class P4HarmonizeGit(object):
 
     def get_src_files(self) -> list[GitFile]:
         src_files = self.list_git_files(self.config["source"]["root"])
-        LOG.info(f"Found {len(src_files)} source files from git ls-tree")
+        SRC_LOG.info(f"Found {len(src_files)} source files from git ls-tree")
         return src_files
 
     def get_dst_files(self) -> list[P4File]:
         p4_stream = self.config["destination"]["stream"]
         dst_files = self.list_p4_files(f"{p4_stream}/...")
-        LOG.info(f"Found {len(dst_files)} tracked files in the destination: {p4_stream}")
+        DST_LOG.info(f"Found {len(dst_files)} tracked files in the destination: {p4_stream}")
         return dst_files
 
     def get_diff(self) -> P4GitFileDiff:
-        LOG.info(f"Finding files in source ({self.config['source']['root']})...")
+        SRC_LOG.info(f"Finding files in source ({self.config['source']['root']})...")
         src_files = self.get_src_files()
         src_files = [src for src in src_files if not self.should_ignore_src(src)]
-        LOG.info(f"Found {len(src_files)} total source files (after ignores)")
+        SRC_LOG.info(f"Found {len(src_files)} total source files (after ignores)")
 
         # list files from dest depot
-        LOG.info(f"Finding files in destination ({self.config['destination']['stream']})...")
+        DST_LOG.info(f"Finding files in destination ({self.config['destination']['stream']})...")
         dst_files = self.get_dst_files()
         dst_files = [dst for dst in dst_files if not self.should_ignore_dst(dst)]
-        LOG.info(f"Found {len(dst_files)} total destination files (after ignores)")
+        DST_LOG.info(f"Found {len(dst_files)} total destination files (after ignores)")
 
         # calculate the actual difference (src only, dst only, changed, etc.)
         return P4GitFileDiff(src_files, dst_files)
@@ -360,7 +419,7 @@ class P4HarmonizeGit(object):
 
         dest_root = self.config["destination"]["root"]
         if os.path.isdir(dest_root) and os.listdir(dest_root):
-            LOG.error(f"Destination root must be empty: {dest_root}")
+            DST_LOG.error(f"Destination root must be empty: {dest_root}")
             sys.exit(1)
 
     def pre_run(self):
@@ -380,6 +439,8 @@ class P4HarmonizeGit(object):
         self.create_dest_p4_client()
 
         diff = self.get_diff()
+        if self.dry_run:
+            LOG.info("Note that comparison stats will be incorrect during dry-run!")
         diff.log_diff()
 
         if not diff.has_difference():
@@ -396,7 +457,7 @@ class P4HarmonizeGit(object):
         files_to_edit = [src for src, dst in diff.changed]
         files_to_copy = files_to_add + files_to_edit
 
-        LOG.info(f"Copying {len(files_to_copy)} files to destination workspace...")
+        DST_LOG.info(f"Copying {len(files_to_copy)} files to destination workspace...")
         with ThreadPoolExecutor(max_workers=MAX_CPU_COUNT) as executor:
             list(executor.map(self.copy_file_to_dst, files_to_copy))
 
@@ -459,11 +520,11 @@ class P4HarmonizeGit(object):
 
         dest_root = self.config["destination"]["root"]
         if os.path.isdir(dest_root):
-            LOG.info(f"Deleting destination root: {dest_root}")
+            DST_LOG.info(f"Deleting destination root: {dest_root}")
             if not self.dry_run:
                 shutil.rmtree(dest_root)
         else:
-            LOG.info(f"Destination root not found: {dest_root}")
+            DST_LOG.info(f"Destination root not found: {dest_root}")
 
 
 class P4HarmonizeGitUnreal(P4HarmonizeGit):
@@ -507,7 +568,7 @@ class P4HarmonizeGitUnreal(P4HarmonizeGit):
     def get_src_files(self):
         src_files = super().get_src_files()
         dep_files = self.get_ue_dependencies()
-        LOG.info(f"Found {len(dep_files)} source files from {self.ue_dependencies_path}")
+        SRC_LOG.info(f"Found {len(dep_files)} source files from {self.ue_dependencies_path}")
         src_files.extend(dep_files)
         return src_files
 
@@ -517,11 +578,11 @@ class P4HarmonizeGitUnreal(P4HarmonizeGit):
         """
         git_deps_exe = os.path.join(self.config["source"]["root"], self.git_dependencies_path)
         if not os.path.isfile(git_deps_exe):
-            LOG.error(f"GitDependencies.exe not found: {git_deps_exe}")
+            SRC_LOG.error(f"GitDependencies.exe not found: {git_deps_exe}")
             sys.exit(1)
 
         args = [git_deps_exe]
-        LOG.info(f"Running {subprocess.list2cmdline(args)}")
+        SRC_LOG.info(f"Running {subprocess.list2cmdline(args)}")
         return subprocess.run(args)
 
     def get_ue_dependencies(self) -> list[GitFile]:
@@ -531,7 +592,7 @@ class P4HarmonizeGitUnreal(P4HarmonizeGit):
         src_root = self.config["source"]["root"]
         deps_file_path = os.path.join(self.config["source"]["root"], self.ue_dependencies_path)
         if not os.path.isfile(deps_file_path):
-            LOG.error(f"{deps_file_path} doesn't exist, run Setup.Bat or GitDependencies.exe first")
+            SRC_LOG.error(f"{deps_file_path} doesn't exist, run Setup.Bat or GitDependencies.exe first")
             sys.exit(1)
 
         tree = ElementTree.parse(deps_file_path)
