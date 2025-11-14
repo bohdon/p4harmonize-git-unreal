@@ -54,10 +54,11 @@ $ python p4harmonize-git-ue.py clean
 - An initial difference is calculated manually:
   - Source or destination only files are easily marked for add/delete
   - Case mismatches are handled as `p4 move` (case-sensitive server) or `p4 delete`, which requires a second run
-  - A simple file size check is done for binary files, and then an `md5` digest is calculated and compared against p4's
-    known digest.
-- Files are copied from git repo -> p4 workspace and staged.
-- Unchanged files are reverted with `p4 revert -a`, this also handles any false-positives from the digest checks.
+  - A quick file size check is done (for binary files only), and if file sizes roughly match (or it's text),
+    a `md5` digest is calculated and compared against p4's known digest.
+- Any files that could possibly differ are copied from git repo -> p4 workspace and staged.
+- Unchanged files are reverted with `p4 revert -a`, which handles any false-positives from the file size or digest
+  checks.
 
 > Nothing is ever submitted automatically, review and submit after running the tool.
 
