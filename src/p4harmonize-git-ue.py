@@ -514,8 +514,8 @@ class P4HarmonizeGit(object):
             if self.is_p4_case_sensitive():
                 # check out and move case mismatches (individually)
                 for src, dst in diff.case_mismatch:
-                        self.p4_run(["edit", "-c", change_id, dst.client_path])
-                        self.p4_run(["move", "-c", change_id, dst.client_path, self.get_dst_path(src)])
+                    self.p4_run(["edit", "-c", change_id, dst.client_path])
+                    self.p4_run(["move", "-c", change_id, dst.client_path, self.get_dst_path(src)])
             else:
                 # mark case mismatches for delete, and require a re-run of this tool
                 LOG.warning(
@@ -604,9 +604,6 @@ class P4HarmonizeGitSegment(P4HarmonizeGit):
         if not pattern:
             DST_LOG.error("No pattern configured for segment (config['segment']['pattern'])")
             return
-        extensions = segment_cfg.get("extensions", [])
-        if not extensions:
-            extensions = [".ini", ".uplugin", ".uproject", ".txt", ".h", ".build.cs", ".cpp", ".build.target.cs"]
 
         try:
             regex = re.compile(pattern)
@@ -636,11 +633,16 @@ class P4HarmonizeGitSegment(P4HarmonizeGit):
         # Gather files whose contents match the pattern
         matches = []
         for e in entries:
+            file_type = e.get("type")
+            if not file_type:
+                continue
+            if not file_type.startswith("text") and not file_type.startswith("utf-8"):
+                continue
+
             client_path = e.get("clientFile").replace(f"//{segment_cfg['p4client']}/", f"{segment_cfg['root']}/")
             if not client_path:
                 continue
-
-            if not os.path.exists(client_path) or os.path.splitext(client_path)[1] not in extensions:
+            if not os.path.exists(client_path):
                 continue
 
             # Prefer reading the workspace file if available, else skip.
