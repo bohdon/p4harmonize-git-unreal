@@ -1,9 +1,15 @@
+#! python
+"""
+Util for syncing a git commit into perforce, purpose built for Unreal Engine.
+"""
+
 from __future__ import annotations
 
 import fnmatch
 import hashlib
 import logging
 import os.path
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +17,7 @@ import tempfile
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Iterable
 from xml.etree import ElementTree
 import re
@@ -23,18 +30,28 @@ LOG = logging.getLogger("main")
 logging.basicConfig(level=logging.DEBUG, format="%(message)s")
 
 RESET = "\033[0m"
+RED = "\033[31m"
 GREEN = "\033[32m"
+YELLOW = "\033[33m"
 BLUE = "\033[34m"
 
 
 class ColorFormatter(logging.Formatter):
     def __init__(self, color, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.colors = {
+            logging.NOTSET: RESET,
+            logging.DEBUG: RESET,
+            logging.INFO: color,
+            logging.WARNING: YELLOW,
+            logging.ERROR: RED,
+            logging.CRITICAL: RED,
+        }
         self.color = color
 
     def format(self, record):
         message = super().format(record)
-        return f"{self.color}{message}{RESET}"
+        return f"{self.colors[record.levelno]}{message}{RESET}"
 
 
 def get_colored_log_handler(color) -> logging.Handler:
@@ -91,6 +108,112 @@ def compute_digest(path: str, file_type: str) -> str:
     return h.hexdigest().upper()
 
 
+class P4Util(object):
+    """
+    Helper to log and run (or dry-run) p4 commands.
+    """
+
+    @classmethod
+    def from_config(cls, config: dict, dry_run=False) -> P4Util:
+        """
+        Create a P4 connection from a config containing at least 'p4port', 'p4user', and 'p4client' keys
+        """
+        util = cls(dry_run=dry_run)
+        util.p4.port = config["p4port"]
+        util.p4.user = config["p4user"]
+        util.p4.client = config["p4client"]
+        util.connect()
+        return util
+
+    def __init__(self, dry_run=False):
+        self.p4 = P4()
+        self.log = LOG
+        self.dry_run = dry_run
+
+    def get_dry_run_msg(self, always_run=False) -> str:
+        return " (skipped for dry-run)" if self.dry_run and not always_run else ""
+
+    def connect(self):
+        self.p4.connect()
+        self.p4.exception_level = P4.RAISE_ERRORS
+
+        if not self.p4.connected():
+            self.log.error("Failed to create P4 connection")
+            sys.exit(1)
+
+    def run(self, args, always_run=False) -> list | None:
+        """
+        Log and run a p4 command.
+        """
+        self.log.info(f"p4 {' '.join(args)}{self.get_dry_run_msg(always_run)}")
+        if not self.dry_run or always_run:
+            result = self.p4.run(*args)
+        else:
+            result = None
+        for warning in self.p4.warnings:
+            self.log.warning(warning)
+        return result
+
+    def cmd(self, args, always_run=False):
+        args = ["p4", "-p", self.p4.port, "-c", self.p4.client, "-u", self.p4.user] + args
+        self.log.info(f"{subprocess.list2cmdline(args)}{self.get_dry_run_msg(always_run)}")
+        if not self.dry_run or always_run:
+            return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return None
+
+    def cmd_batch(self, args, files: Iterable[str], prefix: str, always_run=False):
+        """
+        Run p4 commandline, passing a list of files in by writing it to a temp file and using '-x <tmpfile>'.
+        Used to bypass command line length limits for large amounts of files.
+        """
+        if not self.dry_run or always_run:
+            with tempfile.NamedTemporaryFile(mode="w+", delete=True, delete_on_close=False, prefix=prefix) as tmp:
+                tmp_path = tmp.name.replace("\\", "/")
+                tmp.writelines([f"{f}\n" for f in files])
+                tmp.flush()
+                tmp.close()
+                self.cmd(["-x", tmp_path, *args])
+        else:
+            self.log.info(f"p4 -x ... {subprocess.list2cmdline(args)}{self.get_dry_run_msg()}")
+
+    def create_client(self, name: str, root: str, stream: str):
+        self.log.info(f"Creating p4 client {name}")
+        clients = self.run(["client", "-o", name], True)
+        if clients is None:
+            self.log.error(f"Failed to create p4 client spec for: {name}")
+            sys.exit(1)
+        client = clients[0]
+        client._root = root
+        client._stream = stream
+        client["SubmitOptions"] = "leaveunchanged"
+        self.log.info(f"p4 client -i ... {self.get_dry_run_msg()}")
+        if not self.dry_run:
+            self.p4.save_client(client)
+
+    def create_changelist(self, description: str) -> str:
+        """
+        Create a new Perforce changelist and return the changelist number as a string ("0" for dry-run)
+        """
+        self.log.info(f"Creating changelist: {description}{self.get_dry_run_msg()}")
+        if self.dry_run:
+            return "0"
+
+        change_spec = self.p4.fetch_change()
+        change_spec["Description"] = description
+        result = self.p4.save_change(change_spec)
+
+        # Result can be a list or string, parse out the changelist number
+        out = " ".join([str(x) for x in result]) if isinstance(result, (list, tuple)) else str(result)
+        m = re.search(r"Change\s*(\d+)", out)
+        if not m:
+            self.log.error(f"Failed to parse changelist id from p4 response: {out}")
+            sys.exit(1)
+
+        cl = m.group(1)
+        self.log.info(f"Created changelist {cl}")
+        return cl
+
+
 class GitFile(object):
     def __init__(self, root: str, path: str, is_tracked=True):
         self.root = root
@@ -128,11 +251,10 @@ class P4File(object):
         client_path = fstat.get("clientFile")
         if client_path is not None:
             self.client_path: str = client_path
-
-        # important that this is normalized, since it's used for comparison
-        if self.client_path is not None:
+            # important that this is normalized, since it's used for comparison
             self.relative_path = os.path.relpath(self.client_path, client_root).replace("\\", "/")
         else:
+            self.client_path = ""
             self.relative_path = ""
 
     def __repr__(self):
@@ -241,81 +363,40 @@ class P4HarmonizeGit(object):
         self.config = load_toml_config(config_file)
         self.src_ignore = self.config["source"].get("ignore", self.default_src_ignore)
         self.dst_ignore = self.config["destination"].get("ignore", self.default_dst_ignore)
-        self._p4 = None
+        self._p4util = None
         self.p4_info = None
         self.dry_run = dry_run
 
     @property
-    def p4(self) -> P4:
+    def p4util(self) -> P4Util:
         self.ensure_p4_connection()
-        return self._p4
-
-    def get_dry_run_msg(self, always_run=False) -> str:
-        return " (skipped for dry-run)" if self.dry_run and not always_run else ""
+        return self._p4util
 
     def ensure_p4_connection(self):
-        if self._p4 is None:
-            self._p4 = self.create_p4_connection()
+        if self._p4util is None:
+            self._p4util = P4Util.from_config(self.config["destination"], dry_run=self.dry_run)
+            self._p4util.log = DST_LOG
             # also gather p4 info for case-sensitive checks
-            self.p4_info = self._p4.run_info()[0]
+            self.p4_info = self._p4util.p4.run_info()[0]
 
-    def create_p4_connection(self) -> P4:
-        p4 = P4()
-        dest_config = self.config["destination"]
-        p4.port = dest_config["p4port"]
-        p4.user = dest_config["p4user"]
-        p4.client = dest_config["p4client"]
-
-        p4.connect()
-        p4.exception_level = p4.RAISE_ERRORS
-
-        if not p4.connected():
-            DST_LOG.error("Failed to create P4 connection")
-            sys.exit(1)
-        return p4
-
-    def is_p4_case_sensitive(self):
+    def is_p4_case_sensitive(self) -> bool:
         self.ensure_p4_connection()
         if self.p4_info is not None:
             return self.p4_info["clientCase"] != "insensitive"
+        return False
 
-    def p4_run(self, args, always_run=False) -> list | None:
-        DST_LOG.info(f"p4 {' '.join(args)}{self.get_dry_run_msg(always_run)}")
-        if not self.dry_run or always_run:
-            result = self.p4.run(*args)
-        else:
-            result = None
-        for warning in self.p4.warnings:
-            LOG.warning(warning)
-        return result
-
-    def p4_cmd(self, args, always_run=False):
-        args = ["p4", "-p", self.p4.port, "-c", self.p4.client, "-u", self.p4.user] + args
-        DST_LOG.info(f"{subprocess.list2cmdline(args)}{self.get_dry_run_msg(always_run)}")
-        if not self.dry_run or always_run:
-            return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return None
-
-    def p4_cmd_batch(self, args, files: Iterable[str], prefix: str, always_run=False):
-        """
-        Run p4 commandline, passing a list of files in by writing it to a temp file and using '-x <tmpfile>'.
-        Used to bypass command line length limits for large amounts of files.
-        """
-        if not self.dry_run or always_run:
-            with tempfile.NamedTemporaryFile(mode="w+", delete=True, delete_on_close=False, prefix=prefix) as tmp:
-                tmp_path = tmp.name.replace("\\", "/")
-                tmp.writelines([f"{f}\n" for f in files])
-                tmp.flush()
-                tmp.close()
-                self.p4_cmd(["-x", tmp_path, *args])
-        else:
-            DST_LOG.info(f"p4 -x ... {subprocess.list2cmdline(args)}{self.get_dry_run_msg()}")
-
-    def list_git_files(self, git_dir: str) -> list[GitFile]:
+    def list_git_files(self) -> list[GitFile]:
+        git_dir = self.config["source"]["root"]
         g = git.cmd.Git(git_dir)
         paths = g.ls_tree(["-r", "--name-only", "HEAD"]).split("\n")
         result = [GitFile(git_dir, p) for p in paths]
         return result
+
+    def git_describe(self) -> str:
+        git_dir = self.config["source"]["root"]
+        g = git.cmd.Git(git_dir)
+        # TODO: it's possible this may fail if there's no tags
+        return g.describe(["--tags", "--long"])
 
     def list_p4_files(self, depot_path: str) -> list[P4File]:
         args = [
@@ -324,7 +405,11 @@ class P4HarmonizeGit(object):
             "-Ol",
             depot_path,
         ]
-        fstats = self.p4_run(args, True)
+        fstats = self.p4util.run(args, True)
+
+        if fstats is None:
+            DST_LOG.error("Failed to get fstat results from Perforce")
+            return []
 
         if fstats is None:
             DST_LOG.error("Failed to get fstat results from Perforce")
@@ -349,67 +434,24 @@ class P4HarmonizeGit(object):
 
     def ensure_dst_p4_client_doesnt_exist(self):
         client_name = self.config["destination"]["p4client"]
-        existing_client = self.p4_run(["clients", "-e", client_name])
+        existing_client = self.p4util.run(["clients", "-e", client_name])
         if existing_client:
             DST_LOG.error(f"Destination p4 client already exists: {client_name}, run clean first or delete it manually")
             sys.exit(1)
 
     def create_dest_p4_client(self):
-        client_name = self.config["destination"]["p4client"]
-        DST_LOG.info(f"Creating p4 client {self.config['destination']['p4client']}")
-        clients = self.p4_run(["client", "-o", client_name], True)
-        if clients is None:
-            DST_LOG.error(f"Failed to create p4 client spec for: {client_name}")
-            sys.exit(1)
-        client = clients[0]
-        client._root = self.config["destination"]["root"]
-        client._stream = self.config["destination"]["stream"]
-        client["Options"] = "noallwrite noclobber nocompress unlocked modtime rmdir"
-        client["SubmitOptions"] = "leaveunchanged"
-        DST_LOG.info(f"p4 client -i ... {self.get_dry_run_msg()}")
-        if not self.dry_run:
-            self.p4.save_client(client)
-
-    def create_dest_p4_changelist(self, description: str) -> str:
-        """
-        Create a Perforce changelist on the destination server using the current
-        p4 connection and return the changelist number as a string.
-
-        The method respects dry-run: in dry-run mode it will log the intent and
-        return a placeholder "0".
-        """
-        # In dry-run mode we don't need an actual P4 connection — just log and
-        # return a harmless placeholder.
-        DST_LOG.info(f"Creating changelist: {description}{self.get_dry_run_msg()}")
-        if self.dry_run:
-            # don't actually create the CL for dry-run, return placeholder
-            return "0"
-
-        change_spec = self.p4.fetch_change()
-        change_spec['Description'] = description
-        result = self.p4.save_change(change_spec)
-
-        # Result can be a list or string, parse out the changelist number
-        out = " ".join([str(x) for x in result]) if isinstance(result, (list, tuple)) else str(result)
-        m = re.search(r"Change\s*(\d+)", out)
-        if not m:
-            DST_LOG.error(f"Failed to parse changelist id from p4 response: {out}")
-            sys.exit(1)
-
-        cl = m.group(1)
-        DST_LOG.info(f"Created changelist {cl}")
-        return cl
+        dest_config = self.config["destination"]
+        self.p4util.create_client(dest_config["p4client"], dest_config["root"], dest_config["stream"])
 
     def delete_p4_client(self, p4client: str):
-        clients = self.p4_run(["clients", "-e", p4client])
+        clients = self.p4util.run(["clients", "-e", p4client])
         if not clients:
             DST_LOG.info(f"Client not found: {p4client}")
             return
         else:
             DST_LOG.info(f"Deleting client: {p4client}")
 
-        if not self.dry_run:
-            self.p4_run(["client", "-df", p4client])
+        self.p4util.run(["client", "-df", p4client])
 
     def should_ignore_src(self, src: GitFile):
         for pattern in self.src_ignore:
@@ -424,7 +466,7 @@ class P4HarmonizeGit(object):
         return False
 
     def get_src_files(self) -> list[GitFile]:
-        src_files = self.list_git_files(self.config["source"]["root"])
+        src_files = self.list_git_files()
         SRC_LOG.info(f"Found {len(src_files)} source files from git ls-tree")
         return src_files
 
@@ -470,6 +512,9 @@ class P4HarmonizeGit(object):
         start = time.perf_counter()
         self.run_validate()
 
+        git_desc = self.git_describe()
+        LOG.info(f"Harmonizing {self.config['source']['root']} ({git_desc}) -> {self.config['destination']['stream']}")
+
         self.pre_run()
 
         # create destination workspace, must be done first so we can get clientFile
@@ -488,7 +533,7 @@ class P4HarmonizeGit(object):
 
         # slam files to head revision without syncing anything
         p4_stream = self.config["destination"]["stream"]
-        self.p4_run(["flush", f"{p4_stream}/..."])
+        self.p4util.run(["flush", f"{p4_stream}/..."])
 
         # copy files to dest
         files_to_add = [src for src in diff.src_only]
@@ -507,18 +552,17 @@ class P4HarmonizeGit(object):
             return
 
         # Create a changelist now
-        change_id = None
-        change_id = self.create_dest_p4_changelist("P4HARMONIZE = Staged changes")
+        change_id = self.p4util.create_changelist(f"P4 Harmonize {git_desc}")
 
         if diff.case_mismatch:
             if self.is_p4_case_sensitive():
                 # check out and move case mismatches (individually)
                 for src, dst in diff.case_mismatch:
-                    self.p4_run(["edit", "-c", change_id, dst.client_path])
-                    self.p4_run(["move", "-c", change_id, dst.client_path, self.get_dst_path(src)])
+                    self.p4util.run(["edit", "-c", change_id, dst.client_path])
+                    self.p4util.run(["move", "-c", change_id, dst.client_path, self.get_dst_path(src)])
             else:
                 # mark case mismatches for delete, and require a re-run of this tool
-                LOG.warning(
+                DST_LOG.warning(
                     "Found files that differ in case-only, but the destination server is case insensitive. "
                     "Perforce can't fix case issues on a case insensitive server in one submit. "
                     "The mismatching files will be staged for delete. After submitting, re-run this tool "
@@ -530,16 +574,18 @@ class P4HarmonizeGit(object):
                 files_to_delete.update({dst.client_path for src, dst in diff.case_mismatch})
 
         if files_to_delete:
-            self.p4_cmd_batch(["delete", "-c", change_id], files_to_delete, "p4harmonize_git_delete_")
+            self.p4util.cmd_batch(["delete", "-c", change_id], files_to_delete, "p4harmonize_git_delete_")
 
         # check out files
         if files_to_add:
-            self.p4_cmd_batch(["add", "-c", change_id], [self.get_dst_path(f) for f in files_to_add], "p4harmonize_git_add_")
+            paths = [self.get_dst_path(f) for f in files_to_add]
+            self.p4util.cmd_batch(["add", "-c", change_id], paths, "p4harmonize_git_add_")
         if files_to_edit:
-            self.p4_cmd_batch(["edit", "-c", change_id], [self.get_dst_path(f) for f in files_to_edit], "p4harmonize_git_edit_")
+            paths = [self.get_dst_path(f) for f in files_to_edit]
+            self.p4util.cmd_batch(["edit", "-c", change_id], paths, "p4harmonize_git_edit_")
 
         # revert unchanged files
-        self.p4_run(["revert", "-a", "-c", change_id])
+        self.p4util.run(["revert", "-a", "-c", change_id])
 
         self.post_run(diff)
 
@@ -573,73 +619,87 @@ class P4HarmonizeGit(object):
             DST_LOG.info(f"Destination root not found: {dest_root}")
 
 
-class P4HarmonizeGitSegment(P4HarmonizeGit):
-    def create_p4_connection(self) -> P4:
-        p4 = P4()
-        dest_config = self.config["segment"]
-        p4.port = dest_config["p4port"]
-        p4.user = dest_config["p4user"]
-        p4.client = dest_config["p4client"]
+class P4SegmentUtil(object):
+    """
+    Util for moving files to separate changelists based on text file regex search.
+    """
 
-        p4.connect()
-        p4.exception_level = p4.RAISE_ERRORS
+    def __init__(self, config_file: str, dry_run=False):
+        self.config = load_toml_config(config_file)
+        self._p4util = None
+        self.dry_run = dry_run
 
-        if not p4.connected():
-            DST_LOG.error("Failed to create P4 connection")
-            sys.exit(1)
-        return p4
-    
-    def segment(self):
+    @property
+    def p4util(self) -> P4Util:
+        self.ensure_p4_connection()
+        return self._p4util
+
+    def ensure_p4_connection(self):
+        if self._p4util is None:
+            self._p4util = P4Util.from_config(self.config["segment"], dry_run=self.dry_run)
+            self._p4util.log = DST_LOG
+
+    def segment(self, pattern: str = None):
         """
         Moves all files with the config["pattern"] to a different cl for resolving changes.
 
         Looks at all opened files on the client in config["segment"]["p4client"] and moves
         those whose contents contain a match for config["segment"]["pattern"] to a new changelist.
         """
+        segment_cfg = self.config["segment"]
 
-        # Create the changelist and use p4 reopen to move each file there
-
-        segment_cfg = self.config.get("segment", {})
-        pattern = segment_cfg.get("pattern")
-        if not pattern:
-            DST_LOG.error("No pattern configured for segment (config['segment']['pattern'])")
-            return
+        if pattern is not None:
+            DST_LOG.info(f"Using pattern: {pattern!r}")
+        elif config_pattern := self.config["segment"].get("pattern"):
+            DST_LOG.info(f"No pattern given, using pattern from config: {config_pattern!r}")
+            pattern = config_pattern
+        else:
+            DST_LOG.error("No pattern given, and none in config['segment']['pattern']")
+            sys.exit(1)
 
         try:
             regex = re.compile(pattern)
-        except re.error as e:
-            DST_LOG.error(f"Invalid segment pattern '{pattern}': {e}")
+        except re.error as entry:
+            DST_LOG.error(f"Invalid segment pattern '{pattern}': {entry}")
             return
 
-        change_id = self.create_dest_p4_changelist(f"P4 Harmonize Segment re:{pattern}")
+        # create a changelist for the pattern
+        change_id = self.p4util.create_changelist(f"P4 Harmonize Segment re:{pattern}")
 
         # p4 opened lists files opened in the current client.
-        opened = self.p4_run(["opened"]) or []
+        opened = self.p4util.run(["opened"], True)
 
         # Normalize opened entries: p4 returns dicts with 'clientFile' for tagged output
-        entries = []
+        text_entries = []
         for entry in opened:
             if isinstance(entry, dict) and "clientFile" in entry:
-                entries.append(entry)
+                file_type = entry.get("type")
+                if not file_type:
+                    continue
+                if not file_type.startswith("text") and not file_type.startswith("utf-8"):
+                    continue
+                text_entries.append(entry)
             elif isinstance(entry, str):
                 # untagged output is harder to parse; for safety skip it
                 DST_LOG.debug(f"Skipping untagged opened entry: {entry}")
 
-
-        if not entries:
-            DST_LOG.info("No opened files found on segment client to inspect")
+        if not text_entries:
+            DST_LOG.info(f"No opened text files found on segment client to inspect ({self.p4util.p4.client})")
             return
+
+        # get client root
+        client_info = self.p4util.run(["client", "-o"], True)
+        client_root: str = client_info[0]["Root"]
+        if not os.path.isdir(client_root):
+            DST_LOG.error(f"Client root doesn't exist: {client_root}")
+            return
+
+        DST_LOG.info(f"Searching {len(text_entries)} opened files...")
 
         # Gather files whose contents match the pattern
         matches = []
-        for e in entries:
-            file_type = e.get("type")
-            if not file_type:
-                continue
-            if not file_type.startswith("text") and not file_type.startswith("utf-8"):
-                continue
-
-            client_path = e.get("clientFile").replace(f"//{segment_cfg['p4client']}/", f"{segment_cfg['root']}/")
+        for entry in text_entries:
+            client_path = entry.get("clientFile").replace(f"//{segment_cfg['p4client']}/", f"{client_root}/")
             if not client_path:
                 continue
             if not os.path.exists(client_path):
@@ -652,7 +712,7 @@ class P4HarmonizeGitSegment(P4HarmonizeGit):
                     with open(client_path, "rb") as fh:
                         # decode as utf-8 ignoring errors (pattern likely ascii/utf8)
                         content = fh.read().decode("utf-8", errors="ignore")
-                except Exception:
+                except OSError:
                     content = None
 
             if content is None:
@@ -660,17 +720,15 @@ class P4HarmonizeGitSegment(P4HarmonizeGit):
                 continue
 
             if regex.search(content):
-                DST_LOG.info(f"Reopening {client_path} into changelist {change_id}{self.get_dry_run_msg()}")
-                if not self.dry_run:
-                    # p4 reopen -c <cl> <file>
-                    self.p4_run(["reopen", "-c", change_id, client_path])
+                # p4 reopen -c <cl> <file>
+                self.p4util.run(["reopen", "-c", change_id, client_path])
                 matches.append(client_path)
 
         if not matches:
             DST_LOG.info("No opened files matched segment pattern; nothing to move")
             return
 
-        DST_LOG.info(f"Found {len(matches)} opened files matching segment pattern {pattern}; moved to changelist {change_id}")
+        DST_LOG.info(f"Found {len(matches)} opened files matching pattern {pattern}; moved to changelist {change_id}")
 
 
 class P4HarmonizeGitUnreal(P4HarmonizeGit):
@@ -762,6 +820,17 @@ def cli():
     pass
 
 
+@cli.command(name="config")
+@click.option("-c", "config_file", default="config.toml")
+def _config(config_file: str):
+    """
+    Show the contents of the config file and exit.
+    """
+    LOG.info(f"Config file: {Path(config_file).resolve()}\n")
+    with open(config_file, "r") as fp:
+        LOG.info(fp.read())
+
+
 @cli.command()
 @click.option("-c", "config_file", default="config.toml")
 @click.option("-n", "dry_run", is_flag=True)
@@ -800,6 +869,18 @@ def clean(config_file: str, dry_run=False):
 def segment(config_file: str):
     p4h = P4HarmonizeGitSegment(config_file)
     p4h.segment()
+
+@cli.command()
+@click.option("-c", "config_file", default="config.toml")
+@click.option("-n", "dry_run", is_flag=True)
+@click.argument("pattern", required=False)
+def segment(config_file: str, pattern: str, dry_run=False):
+    """
+    Move files to a new changelist by searching for a regex pattern.
+    """
+    p4h = P4SegmentUtil(config_file, dry_run=dry_run)
+    p4h.segment(pattern)
+
 
 if __name__ == "__main__":
     cli()
