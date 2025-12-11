@@ -668,12 +668,12 @@ class P4SegmentUtil(object):
         text_entries = []
         for entry in opened:
             if isinstance(entry, dict) and "clientFile" in entry:
-                text_entries.append(entry)
                 file_type = entry.get("type")
                 if not file_type:
                     continue
                 if not file_type.startswith("text") and not file_type.startswith("utf-8"):
                     continue
+                text_entries.append(entry)
             elif isinstance(entry, str):
                 # untagged output is harder to parse; for safety skip it
                 DST_LOG.debug(f"Skipping untagged opened entry: {entry}")
@@ -858,7 +858,6 @@ def clean(config_file: str, dry_run=False):
 
     if dry_run:
         LOG.info("This was a dry-run.")
-
 
 @cli.command()
 @click.option("-c", "config_file", default="config.toml")
