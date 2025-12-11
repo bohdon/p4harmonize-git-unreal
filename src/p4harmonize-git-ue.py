@@ -411,10 +411,6 @@ class P4HarmonizeGit(object):
             DST_LOG.error("Failed to get fstat results from Perforce")
             return []
 
-        if fstats is None:
-            DST_LOG.error("Failed to get fstat results from Perforce")
-            return []
-
         len_before_ignore = len(fstats)
         ignore_actions = ("delete", "move/delete", "purge", "archive")
         fstats[:] = [f for f in fstats if f["headAction"] not in ignore_actions]
@@ -863,12 +859,6 @@ def clean(config_file: str, dry_run=False):
 
     if dry_run:
         LOG.info("This was a dry-run.")
-
-@cli.command()
-@click.option("-c", "config_file", default="config.toml")
-def segment(config_file: str):
-    p4h = P4HarmonizeGitSegment(config_file)
-    p4h.segment()
 
 @cli.command()
 @click.option("-c", "config_file", default="config.toml")
